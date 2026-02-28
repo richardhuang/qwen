@@ -377,16 +377,77 @@ def paginate_output(lines, lines_per_page=20):
             # Any other key - continue normally
             continue
 
-def tail_follow(file_path):
-    """Follow a file and output new content as it's appended"""
+def get_currently_tracking_file(directory_path=None):
+    """Get the currently tracking file path and its inode for change detection"""
+    if directory_path is None:
+        directory_path = find_qwen_project_dir()
+    if directory_path is None:
+        return None, None
+
+    directory = Path(directory_path)
+
+    # Find all .jsonl files in the directory
+    files = list(directory.rglob("*.jsonl"))
+    if not files:
+        return None, None
+
+    # Get the most recently modified file
+    latest_file = max(files, key=lambda f: f.stat().st_mtime)
+    try:
+        return str(latest_file), latest_file.stat().st_ino
+    except (OSError, FileNotFoundError):
+        return None, None
+
+
+def tail_follow(file_path=None, directory_path=None):
+    """Follow a file and output new content as it's appended.
+    Automatically detects if Qwen creates a new log file and switches to it.
+    """
     print("Following log with beautiful formatting...")
     print("Press Ctrl+C to stop")
     print("===========================================")
 
-    # Go to the end of the file initially
-    with open(file_path, 'r') as f:
-        f.seek(0, os.SEEK_END)
+    # Auto-detect directory if not provided
+    if directory_path is None and file_path is None:
+        directory_path = find_qwen_project_dir()
+        if directory_path is None:
+            print("Error: Cannot find Qwen project directory.")
+            sys.exit(1)
+    elif file_path is None:
+        # Only directory provided, find latest file
+        file_path, _ = get_currently_tracking_file(directory_path)
+        if file_path is None:
+            print(f"Error: No .jsonl files found in {directory_path}")
+            sys.exit(1)
 
+    # If file_path is provided but directory_path is not, try to find the directory
+    if file_path is not None and directory_path is None:
+        p = Path(file_path)
+        if p.is_file():
+            directory_path = str(p.parent)
+        else:
+            print(f"Error: Cannot determine directory for {file_path}")
+            sys.exit(1)
+
+    # Get the initial file's inode for change detection
+    try:
+        current_inode = Path(file_path).stat().st_ino
+    except (OSError, FileNotFoundError):
+        print(f"Error: Cannot access {file_path}")
+        sys.exit(1)
+
+    print(f"Monitoring: {file_path}")
+    print(f"Monitoring directory: {directory_path}")
+
+    # Open file and go to the end initially
+    try:
+        f = open(file_path, 'r')
+        f.seek(0, os.SEEK_END)
+    except IOError as e:
+        print(f"Error opening file: {e}")
+        sys.exit(1)
+
+    try:
         while True:
             line = f.readline()
             if line:
@@ -397,35 +458,103 @@ def tail_follow(file_path):
                     # If it's not JSON, print as raw line
                     print(f"📄 Raw Line: {line.strip()}")
             else:
-                time.sleep(0.1)  # Sleep briefly before checking for new lines
+                # No new line, check if file was rotated/renamed
+                time.sleep(0.1)
+
+                # Try to get current file info
+                try:
+                    current_path = Path(file_path)
+                    new_inode = current_path.stat().st_ino
+
+                    # If inode changed, file was replaced
+                    if new_inode != current_inode:
+                        print(f"\nDetected new log file, switching to: {file_path}")
+                        f.close()
+                        f = open(file_path, 'r')
+                        f.seek(0, os.SEEK_END)
+                        current_inode = new_inode
+                except (OSError, FileNotFoundError):
+                    # File was deleted or moved, look for new log file
+                    print(f"\nLog file rotated, finding new log file...")
+                    f.close()
+
+                    # Look for the latest .jsonl file in the directory
+                    new_file_path, new_inode = get_currently_tracking_file(directory_path)
+                    if new_file_path and new_file_path != file_path:
+                        print(f"Switching to new log file: {new_file_path}")
+                        file_path = new_file_path
+                        f = open(file_path, 'r')
+                        f.seek(0, os.SEEK_END)
+                        current_inode = new_inode
+                    elif new_file_path:
+                        # Same file, just wait
+                        time.sleep(0.1)
+                    else:
+                        # No log file found, wait and retry
+                        time.sleep(1)
+
+    except KeyboardInterrupt:
+        f.close()
+        raise
+    finally:
+        f.close()
 
 def main():
     parser = argparse.ArgumentParser(description='Format and display log files with pagination or follow mode.')
     parser.add_argument('-f', '--follow', action='store_true', help='Follow mode - continuously track new log entries')
     parser.add_argument('logfile', nargs='?', default=None, help='Path to the log file or directory to process (auto-detected if not provided)')
+    parser.add_argument('-d', '--directory', nargs='?', default=None, help='Directory to monitor for new log files (used with -f)')
 
     args = parser.parse_args()
 
-    # Check if the provided path is a directory, or auto-detect if not provided
-    if args.logfile:
-        if os.path.isdir(args.logfile):
-            file_path = find_latest_file(args.logfile)
-        else:
-            file_path = args.logfile
-    else:
-        # Auto-detect and find latest file
-        file_path = find_latest_file()
-
-    if not os.path.exists(file_path):
-        print(f"Error: Log file {file_path} does not exist.")
-        sys.exit(1)
-
     if args.follow:
+        # Follow mode
+        if args.logfile:
+            if os.path.isdir(args.logfile):
+                # Directory provided, monitor for new files in it
+                directory_path = args.logfile
+                file_path = None  # Will be auto-detected
+            else:
+                # Specific file provided
+                file_path = args.logfile
+                directory_path = None
+        else:
+            # Auto-detect
+            file_path = None
+            directory_path = args.directory or find_qwen_project_dir()
+            if directory_path is None:
+                print("Error: Cannot find Qwen project directory.")
+                sys.exit(1)
+
+        if not os.path.exists(file_path) if file_path else True:
+            # Check if directory has any .jsonl files
+            test_dir = directory_path or (find_qwen_project_dir() if not args.directory else args.directory)
+            if test_dir:
+                jsonl_files = list(Path(test_dir).rglob("*.jsonl"))
+                if not jsonl_files:
+                    print(f"Error: No .jsonl files found in {test_dir}")
+                    sys.exit(1)
+
         try:
-            tail_follow(file_path)
+            tail_follow(file_path=file_path, directory_path=directory_path)
         except KeyboardInterrupt:
             print("\nStopping...")
     else:
+        # Normal mode - single file processing
+        # Check if the provided path is a directory, or auto-detect if not provided
+        if args.logfile:
+            if os.path.isdir(args.logfile):
+                file_path = find_latest_file(args.logfile)
+            else:
+                file_path = args.logfile
+        else:
+            # Auto-detect and find latest file
+            file_path = find_latest_file()
+
+        if not os.path.exists(file_path):
+            print(f"Error: Log file {file_path} does not exist.")
+            sys.exit(1)
+
         try:
             with open(file_path, 'r') as f:
                 lines = f.readlines()
